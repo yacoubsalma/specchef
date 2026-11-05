@@ -1,0 +1,39 @@
+# compiled output
+/dist
+/node_modules
+/uploads/*
+!/uploads/.gitkeep
+
+# Logs
+logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+
+# IDEs
+/.idea
+.project
+.classpath
+.c9/
+*.launch
+.settings/
+*.sublime-workspace
+
+# IDE - VSCode
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# ✅ Prisma
+/generated/prisma
+.env.local
+.env.*.local
+
+# ✅ MongoDB local data (if running local)
+/data/mongodb
+*.db
+*.sqlite

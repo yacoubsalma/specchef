@@ -1,0 +1,24 @@
+# Dépendances et builds
+node_modules/
+dist/
+.next/
+out/
+*.tsbuildinfo
+next-env.d.ts
+
+# Secrets : ne jamais commiter
+.env
+.env.*
+!.env.example
+
+# Fichiers générés / locaux
+backend/uploads/*
+!backend/uploads/.gitkeep
+__pycache__/
+*.pyc
+.venv/
+coverage/
+*.log
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,812 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mongodb"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================================
+// AUTH / USERS
+// ============================================================================
+
+enum Role {
+  ADMIN
+  QA
+  BA
+  PO
+}
+
+model User {
+  id                String    @id @default(auto()) @map("_id") @db.ObjectId
+  email             String    @unique
+  name              String
+  password          String
+  role              Role      @default(QA)
+  isEmailVerified   Boolean   @default(false)
+  otpCode           String?
+  otpCodeExpiresAt  DateTime?
+  isActive          Boolean   @default(true)
+  created_at        DateTime  @default(now())
+  updated_at        DateTime  @updatedAt
+
+  // Relations
+  ownedProjects      Project[]          @relation("ProjectOwner")
+  assignedProjectIds String[]           @db.ObjectId
+  assignedProjects   Project[]          @relation("ProjectAssignees", fields: [assignedProjectIds], references: [id])
+  pinnedProjectIds   String[]           @db.ObjectId @default([])
+  blacklistedTokens  BlacklistedToken[]
+  jiraCredential     JiraCredential?
+  comments           Comment[]          @relation("CommentAuthor")
+  notifications      Notification[]
+  createdWorkflows   TestWorkflow[]     @relation("WorkflowCreator")
+  validatedWorkflows TestWorkflow[]     @relation("WorkflowValidator")
+  assignedWorkflowIds String[]          @db.ObjectId @default([])
+  assignedWorkflows  TestWorkflow[]     @relation("WorkflowAssignees", fields: [assignedWorkflowIds], references: [id])
+  assignedQaWorkflowIds String[]        @db.ObjectId @default([])
+  assignedQaWorkflows   TestWorkflow[]  @relation("WorkflowQaAssignees", fields: [assignedQaWorkflowIds], references: [id])
+  workflowRuns       WorkflowRun[]      @relation("WorkflowRunExecutor")
+  executedTestCases  TestCase[]         @relation("TestCaseExecutor")
+
+  @@map("users")
+}
+
+// ============================================================================
+// JIRA — connexion Jira par utilisateur (export des cas de test)
+// ============================================================================
+
+model JiraCredential {
+  id              String   @id @default(auto()) @map("_id") @db.ObjectId
+  user_id         String   @unique @db.ObjectId
+  user            User     @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  // URL de base de l'instance Jira (ex: https://mycompany.atlassian.net)
+  jira_base_url   String
+  // Email du compte Jira (utilisé pour l'auth Basic avec le token API)
+  jira_email      String
+
+  // Token API Jira chiffré (AES-256-GCM) — jamais stocké ni renvoyé en clair
+  encrypted_token String
+  token_iv        String
+  token_auth_tag  String
+
+  created_at      DateTime @default(now())
+  updated_at      DateTime @updatedAt
+
+  @@map("jira_credentials")
+}
+
+model BlacklistedToken {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  token     String
+  userId    String   @db.ObjectId
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([token])
+  @@index([expiresAt])
+  @@index([userId])
+  @@map("blacklisted_tokens")
+}
+
+// ============================================================================
+// PROJECT
+// ============================================================================
+
+model Project {
+  id                     String                @id @default(auto()) @map("_id") @db.ObjectId
+  name                   String
+  document_type          String?
+  source_hash            String?
+  status                 String                @default("processing")
+  error_message          String?
+  extraction_duration_ms Int?
+  created_at             DateTime              @default(now())
+  updated_at             DateTime              @updatedAt
+
+  // ── Rejets de test cases EN ATTENTE (jamais persistés) ─────────────────────
+  // BUGFIX : un simple compteur (Int) ne peut pas alimenter "Tendance des
+  // test cases (14 derniers jours)" ni "Par statut" côté dashboard QA, qui
+  // ont besoin d'une DATE par rejet pour savoir s'il tombe dans la fenêtre
+  // demandée. On stocke donc un horodatage par rejet plutôt qu'un total sec ;
+  // rejectedPendingCount (dashboard) redevient simplement rejected_pending_dates.length.
+  rejected_pending_dates DateTime[]            @default([])
+
+  // ── Espace Confluence auto-créé (compte Atlassian partagé avec Jira) ──────
+  // "none" | "pending" | "created" | "failed"
+  confluence_status      String                @default("none")
+  confluence_space_key   String?
+  confluence_space_id    String?
+  confluence_space_url   String?
+  confluence_error       String?
+  confluence_created_at  DateTime?
+
+  // ── Propriétaire du projet (ajouté avec le module d'authentification) ─────
+  owner_id        String?               @db.ObjectId
+  owner           User?                 @relation("ProjectOwner", fields: [owner_id], references: [id], onDelete: SetNull)
+
+  // ── Utilisateurs assignés (collaborateurs — plusieurs par projet) ─────────
+  assignedUserIds String[]              @db.ObjectId
+  assignedUsers   User[]                @relation("ProjectAssignees", fields: [assignedUserIds], references: [id])
+
+  // ── Campagne de tests ────────────────────────────────────────────────────
+  // "draft" (par défaut) = projet modifiable normalement (BA peut créer/éditer
+  // modules, exigences, cas de test, workflows). "launched" = campagne en
+  // cours :
+  //   • Modules / exigences / cas de test : les modifications ne sont PAS
+  //     rejetées, mais ne s'appliquent plus non plus tout de suite — elles
+  //     sont mises "en standby" (voir CampaignChange /
+  //     ProjectService.queueIfCampaignActive) et resteront sans effet sur les
+  //     données réelles jusqu'à la clôture de la campagne.
+  //   • Workflows : toujours figés (comportement inchangé, voir
+  //     WorkflowService), seule l'EXÉCUTION des workflows déjà créés/validés
+  //     reste possible (voir WorkflowService.startRun, qui au contraire
+  //     REFUSE de démarrer un run tant que la campagne n'est pas "launched").
+  // Réversible : ADMIN/BA/QA peuvent clôturer la campagne (voir
+  // ProjectService.closeCampaign) — à ce moment, chaque modification mise en
+  // standby doit être explicitement gardée (rejouée sur les vraies données)
+  // ou annulée (jamais appliquée) avant que le projet ne repasse en "draft".
+  campaign_status         String    @default("draft")
+  campaign_launched_at    DateTime?
+  campaign_launched_by_id String?   @db.ObjectId
+  campaign_closed_at      DateTime?
+
+  modules         RequirementModule[]
+  workflows       TestWorkflow[]
+  campaignChanges CampaignChange[]
+  campaignRuns    CampaignRun[]
+
+  @@index([owner_id])
+  @@map("projects")
+}
+
+// ============================================================================
+// CAMPAGNE DE TESTS — MODIFICATIONS EN ATTENTE (staging)
+// ============================================================================
+// Pendant qu'une campagne est "launched", les mutations de contenu (modules,
+// exigences, cas de test — voir ProjectService.queueIfCampaignActive) ne sont
+// plus refusées (ancien comportement : ForbiddenException) mais mises en
+// attente ici, SANS toucher à l'entité réelle. `method` + `args` permettent
+// de rejouer exactement le même appel de service plus tard (voir
+// ProjectService.closeCampaign) plutôt que de dupliquer la logique métier de
+// chaque mutation (versioning, analyse d'impact, embeddings...).
+model CampaignChange {
+  id              String    @id @default(auto()) @map("_id") @db.ObjectId
+  project_id      String    @db.ObjectId
+  project         Project   @relation(fields: [project_id], references: [id], onDelete: Cascade)
+
+  // Nom de la méthode ProjectService à rejouer si l'utilisateur choisit de
+  // GARDER cette modification à la clôture de la campagne.
+  method          String
+  args            Json      @default("[]")
+
+  entity_type     String    // 'requirement_module' | 'requirement' | 'test_case'
+  entity_id       String?   // null pour une création (l'entité n'existe pas encore au moment de la mise en attente)
+  label           String    // libellé lisible affiché dans le récapitulatif de clôture (ex: "Modifier l'exigence REQ-12")
+
+  // 'pending' (en attente de décision BA/Admin/QA à la clôture) | 'applied' | 'discarded' | 'failed'
+  status          String    @default("pending")
+  error_message   String?   // renseigné si status='failed' (ex: conflit d'édition détecté au rejeu)
+
+  changed_by_id   String?   @db.ObjectId
+  changed_by_name String?
+
+  created_at      DateTime  @default(now())
+  resolved_at     DateTime?
+
+  @@index([project_id, status])
+  @@map("campaign_changes")
+}
+
+// ── Historique des campagnes de tests ────────────────────────────────────
+// Un enregistrement par cycle lancement→clôture, créé au lancement (voir
+// ProjectService.launchCampaign) et complété à la clôture (voir
+// ProjectService.closeCampaign) avec le snapshot final des résultats. Ne
+// couvre que les campagnes lancées APRÈS l'introduction de ce modèle — les
+// clôtures antérieures (déjà écrasées sur Project.campaign_closed_at) ne
+// sont pas rétroactivement reconstituables.
+model CampaignRun {
+  id              String    @id @default(auto()) @map("_id") @db.ObjectId
+  project_id      String    @db.ObjectId
+  project         Project   @relation(fields: [project_id], references: [id], onDelete: Cascade)
+
+  launched_at     DateTime  @default(now())
+  launched_by_id  String?   @db.ObjectId
+  launched_by_name String?
+
+  // null tant que la campagne est encore active (voir getCampaignHistory,
+  // qui exclut le run en cours — déjà couvert par getCampaignProgress).
+  closed_at       DateTime?
+  closed_by_id    String?   @db.ObjectId
+  closed_by_name  String?
+
+  // Snapshot des résultats au moment de la clôture (mêmes chiffres que
+  // getCampaignProgress renvoyait juste avant closeCampaign).
+  total_test_cases    Int?
+  passed_test_cases   Int?
+  failed_test_cases   Int?
+  progress_pct        Int?
+  applied_changes_count    Int?
+  discarded_changes_count  Int?
+
+  // Détail complet au moment de la clôture (mêmes formes que
+  // getCampaignProgress.failedTestCases / .workflows.items) — permet à
+  // l'export d'une entrée d'historique d'être aussi complet que celui de la
+  // campagne en cours, au lieu de se limiter aux totaux ci-dessus. Peut être
+  // absent (undefined) pour une entrée créée avant l'ajout de ces champs.
+  failed_test_cases_detail Json?
+  workflows_detail         Json?
+
+  @@index([project_id, launched_at])
+  @@map("campaign_runs")
+}
+
+// ============================================================================
+// REQUIREMENT MODULE
+// ============================================================================
+
+model RequirementModule {
+  id              String                @id @default(auto()) @map("_id") @db.ObjectId
+  name            String
+  description     String?
+  project_id      String                @db.ObjectId
+  project         Project               @relation(fields: [project_id], references: [id], onDelete: Cascade)
+  created_at      DateTime              @default(now())
+  updated_at      DateTime              @updatedAt
+
+  requirements    Requirement[]
+
+  // ── Versioning / historique (voir EntityVersion) ───────────────────────────
+  // Optionnel (et non fiable à 100% en lecture) : les documents créés avant
+  // l'introduction du versioning n'ont pas ce champ en base — Mongo étant
+  // schemaless, Prisma le lirait comme `undefined` si le champ était requis.
+  // `?? 1` côté service pour les anciens documents ; script
+  // `scripts/backfill-versions.ts` pour les faire converger proprement.
+  version         Int?                  @default(1)
+
+  // ── Hiérarchie Jira (le Module = l'Epic) — créé une seule fois au premier
+  // export d'une exigence de ce module, puis réutilisé pour toutes les autres ──
+  jira_project_key String?
+  jira_epic_key    String?
+  jira_epic_url    String?
+
+  @@index([project_id])
+  @@map("requirement_modules")
+}
+
+// ============================================================================
+// REQUIREMENT
+// ============================================================================
+
+model Requirement {
+  id              String                @id @default(auto()) @map("_id") @db.ObjectId
+  req_id          String
+  description     String
+  priority        String
+  module_id       String                @db.ObjectId
+  module          RequirementModule     @relation(fields: [module_id], references: [id], onDelete: Cascade)
+  manually_edited Boolean               @default(false)
+
+  // ── Revue manuelle de couverture ────────────────────────────────────────
+  // true = un utilisateur a confirmé que cette exigence "non ancrée" (ne
+  // correspondant à aucun passage précis du SRS) est en fait justifiée.
+  // Elle sort alors de l'onglet "⚠️ Exigences à vérifier".
+  coverage_dismissed Boolean            @default(false)
+
+  // ── Versioning / historique (voir EntityVersion + commentaire RequirementModule.version) ──
+  version         Int?                  @default(1)
+
+  // ── Analyse d'impact (édition SRS) ─────────────────────────────────────────
+  // Score de similarité cosinus (embeddings nomic-embed-text) entre l'ancienne
+  // et la nouvelle description lors de la dernière édition BA.
+  // null = jamais éditée sémantiquement (création ou édition priorité/id seule).
+  last_edit_similarity Float?
+  last_edit_at         DateTime?
+
+  // ── Analyse d'impact — exigence couplée (édition SRS) ──────────────────────
+  // Positionné à true quand une AUTRE exigence sémantiquement couplée est
+  // modifiée par le BA (voir ProjectService._flagCoupledRequirements).
+  // Remis à false automatiquement dès que ses TC ne sont plus "à réviser", ou
+  // manuellement via PATCH requirements/:id/acknowledge-review.
+  needs_review        Boolean               @default(false)
+  needs_review_reason String?
+  needs_review_at     DateTime?
+
+  created_at      DateTime              @default(now())
+  updated_at      DateTime              @updatedAt
+
+  test_cases      TestCase[]
+
+  // ── Hiérarchie Jira (Story = cette exigence) — créée une seule fois au
+  // premier export d'un de ses cas de test, puis réutilisée pour les suivants.
+  // L'Epic parent est celui du Module (voir RequirementModule.jira_epic_key).
+  jira_project_key String?
+  jira_story_key   String?
+  jira_story_url   String?
+
+  // ── Dashboard de couverture SRS ↔ Exigences ───────────────────────────────
+  // Vecteur d'embedding généré par nomic-embed-text (768 dimensions) à partir
+  // de "req_id: description". Calculé paresseusement (lazy) par CoverageService
+  // au premier calcul de couverture du projet, puis mis en cache ici pour ne
+  // plus jamais réembedder cette exigence tant qu'elle n'a pas changé.
+  embedding       Float[]               @default([])
+
+  // ── Autosave des TC générés mais pas encore validés (invisible côté UI) ────
+  // Tant qu'un TC généré n'est pas validé par le QA (pas encore en base dans
+  // TestCase), il ne vit qu'en mémoire côté front — et disparaissait donc au
+  // moindre reload. On sauvegarde ici, en arrière-plan, un instantané JSON de
+  // ces TC "en attente" pour ce requirement, restauré tel quel au chargement
+  // du projet (sans id, exactement comme s'ils venaient d'être générés dans
+  // la session) : aucun comportement ni affichage existant n'est modifié.
+  pending_test_cases Json?
+
+  @@index([module_id])
+  @@index([req_id])
+  @@map("requirements")
+}
+
+// ============================================================================
+// TEST CASE — avec champ embedding pour Atlas Vector Search
+// ============================================================================
+
+model TestCase {
+  id              String                @id @default(auto()) @map("_id") @db.ObjectId
+  test_id         String
+  title           String
+  preconditions   String[]              @default([])
+  steps           String[]              @default([])
+  test_data       String[]              @default([])
+  expected_result String?
+  type            String
+  priority        String
+  requirement_id  String                @db.ObjectId
+  requirement     Requirement           @relation(fields: [requirement_id], references: [id], onDelete: Cascade)
+
+  // ── Atlas Vector Search ──────────────────────────────────────────────────
+  // Vecteur d'embedding généré par nomic-embed-text (768 dimensions)
+  // Indexé via Atlas Search index "test_cases_vector_index"
+  embedding       Float[]               @default([])
+
+  validated       Boolean               @default(false)
+  validated_at    DateTime?
+  manually_edited Boolean               @default(false)
+
+  // ── Versioning / historique (voir EntityVersion + commentaire RequirementModule.version) ──
+  version         Int?                  @default(1)
+
+  // ── Statut de revue persistant (QA) ────────────────────────────────────────
+  // "pending" (généré, en attente) | "validated" | "rejected"
+  // `validated` (bool) ci-dessus reste en synchro pour compat rétroactive.
+  review_status   String                @default("pending")
+  rejected_at     DateTime?
+
+  // ── Analyse d'impact (édition SRS) ─────────────────────────────────────────
+  // Positionné à true automatiquement quand l'exigence associée (ou une
+  // exigence sémantiquement couplée) est modifiée par le BA. Remis à false dès
+  // que le QA agit sur le TC (édition ou passage par reviewTestCase).
+  needs_review        Boolean               @default(false)
+  needs_review_reason String?
+  needs_review_at     DateTime?
+
+  // ── Export Jira ──────────────────────────────────────────────────────────
+  jira_issue_key  String?
+  jira_issue_url  String?
+  jira_project_key String?
+  jira_exported_at DateTime?
+
+  // ── Exécution (campagne de tests) ──────────────────────────────────────────
+  // Résultat du dernier passage QA saisi directement sur la carte du TC
+  // (bouton Réussi/Échoué/Non testé), indépendant du système de workflows.
+  // Remis à "not_tested" automatiquement à chaque lancement d'une nouvelle
+  // campagne (voir ProjectService.launchCampaign) pour repartir de zéro.
+  execution_status  String    @default("not_tested") // "not_tested" | "passed" | "failed"
+  executed_at       DateTime?
+  executed_by_id    String?   @db.ObjectId
+  executed_by       User?     @relation("TestCaseExecutor", fields: [executed_by_id], references: [id], onDelete: SetNull)
+
+  created_at      DateTime              @default(now())
+  updated_at      DateTime              @updatedAt
+
+  @@index([requirement_id])
+  @@index([test_id])
+  @@map("test_cases")
+}
+
+// ============================================================================
+// SRS DOCUMENT — avec embeddings des chunks stockés dans une collection dédiée
+// ============================================================================
+
+model SrsDocument {
+  id              String                @id @default(auto()) @map("_id") @db.ObjectId
+  project_id      String                @db.ObjectId
+  filename        String
+  content         String
+  chunks_count    Int
+  indexed_at      DateTime              @default(now())
+  created_at      DateTime              @default(now())
+  updated_at      DateTime              @updatedAt
+
+  chunks          SrsChunk[]
+
+  @@index([project_id])
+  @@map("srs_documents")
+}
+
+// ============================================================================
+// SRS CHUNK — paragraphes indexés avec embeddings (remplace Chroma srs_paragraphs)
+// ============================================================================
+
+model SrsChunk {
+  id              String                @id @default(auto()) @map("_id") @db.ObjectId
+  srs_document_id String                @db.ObjectId
+  srs_document    SrsDocument           @relation(fields: [srs_document_id], references: [id], onDelete: Cascade)
+  project_id      String
+  chunk_index     Int
+  text            String
+
+  // ── Atlas Vector Search ──────────────────────────────────────────────────
+  // Vecteur d'embedding généré par nomic-embed-text (768 dimensions)
+  // Indexé via Atlas Search index "srs_chunks_vector_index"
+  embedding       Float[]               @default([])
+
+  created_at      DateTime              @default(now())
+
+  // ── Revue manuelle de couverture ────────────────────────────────────────
+  // true = un utilisateur a confirmé que ce chunk contient du vrai contenu,
+  // malgré la détection heuristique de bruit (isNoiseChunk côté CoverageService).
+  // Le chunk sort alors définitivement de la liste "ignorés" et rejoint le
+  // calcul normal de couverture (comparé aux exigences → couvert ou orphelin).
+  overridden_as_content Boolean          @default(false)
+
+  // true = ce passage vient d'être repris en compte manuellement (ex-ignoré) et
+  // doit obligatoirement repasser par "❌ À traiter" pour une décision explicite,
+  // même s'il ressemble par hasard à une exigence existante. Remis à false dès
+  // qu'une exigence est générée spécifiquement pour ce passage.
+  force_review          Boolean          @default(false)
+
+  // Lien direct vers l'exigence générée spécifiquement pour ce passage (bouton
+  // "Générer une exigence" puis "Garder"). Une fois ce lien posé, le passage est
+  // TOUJOURS "couvert" sans repasser par la comparaison de similarité — sinon une
+  // exigence fraîchement générée pouvait, par formulation différente, ne pas
+  // matcher son propre passage source et rester coincée en "à traiter".
+  linked_requirement_id String?          @db.ObjectId
+
+  // true = un utilisateur a décidé que ce passage (pourtant du vrai contenu,
+  // pas du bruit) n'a volontairement pas besoin d'exigence. Il rejoint alors
+  // l'onglet "🚫 Passages exclus", sans repasser par la comparaison normale.
+  manually_ignored      Boolean          @default(false)
+
+  @@index([project_id])
+  @@index([srs_document_id])
+  @@map("srs_chunks")
+}
+model GenerationHistory {
+  id             String   @id @default(auto()) @map("_id") @db.ObjectId
+  project_id     String   @db.ObjectId
+  requirement_id String   @db.ObjectId  // ObjectId du Requirement
+  req_id         String                 // req_id métier (FR-01)
+  titles         String[] @default([])  // titres normalisés (lowercase+trim)
+
+  @@unique([project_id, requirement_id])  // 1 doc par paire
+  @@map("generation_history")
+}
+model GenerationHistoryEntry {
+  id              String   @id @default(auto()) @map("_id") @db.ObjectId
+  project_id      String   @db.ObjectId
+  requirement_id  String   @db.ObjectId  // ObjectId du Requirement
+  req_id          String                 // req_id métier (FR-01)
+
+  // ── TC complet ─────────────────────────────────────────────────────────────
+  test_id         String
+  title           String
+  preconditions   String[] @default([])
+  steps           String[] @default([])
+  test_data       String[] @default([])
+  expected_result String?
+  type            String
+  priority        String
+
+  // ── Atlas Vector Search ──────────────────────────────────────────────────
+  // Vecteur nomic-embed-text 768 dimensions, indexé via "generation_history_vector_index"
+  embedding       Float[]  @default([])
+
+  created_at      DateTime @default(now())
+
+  @@index([project_id, requirement_id])
+  @@map("generation_history_entries")
+}
+
+// ============================================================================
+// COLLABORATION — commentaires sur exigences et cas de test
+// ============================================================================
+
+model Comment {
+  id                 String    @id @default(auto()) @map("_id") @db.ObjectId
+  project_id         String    @db.ObjectId
+
+  // Cible du commentaire : "requirement" | "test_case"
+  entity_type        String
+  entity_id          String    @db.ObjectId
+
+  content            String
+
+  // IDs des utilisateurs mentionnés (@utilisateur), résolus côté frontend
+  mentioned_user_ids String[]  @db.ObjectId
+
+  author_id          String    @db.ObjectId
+  author             User      @relation("CommentAuthor", fields: [author_id], references: [id], onDelete: Cascade)
+
+  // Réponse à un autre commentaire (fil de discussion) — null si commentaire racine
+  parent_id          String?   @db.ObjectId
+
+  // ── Résolution (revue collaborative avant validation) ─────────────────────
+  // Coché par l'auteur au moment de l'écriture : seuls les autres membres
+  // (jamais l'auteur lui-même) verront alors le bouton "Résoudre" sur ce commentaire.
+  requires_resolution Boolean  @default(false)
+  resolved           Boolean   @default(false)
+  resolved_by_id     String?   @db.ObjectId
+  resolved_at        DateTime?
+
+  created_at         DateTime  @default(now())
+  updated_at         DateTime  @updatedAt
+
+  @@index([project_id, entity_type, entity_id])
+  @@index([parent_id])
+  @@map("comments")
+}
+
+// Suivi de lecture des fils de commentaires par utilisateur — un enregistrement
+// par (utilisateur, exigence/TC) mémorisant la dernière consultation, pour
+// déterminer si un commentaire est "non vu" (badge rouge côté frontend).
+model CommentRead {
+  id            String   @id @default(auto()) @map("_id") @db.ObjectId
+
+  user_id       String   @db.ObjectId
+  project_id    String   @db.ObjectId
+  entity_type   String
+  entity_id     String   @db.ObjectId
+
+  last_read_at  DateTime @default(now())
+
+  @@unique([user_id, entity_type, entity_id])
+  @@index([project_id, user_id])
+  @@map("comment_reads")
+}
+
+// ============================================================================
+// FIL D'ACTIVITÉ PROJET — journal partagé, une ligne par événement, visible
+// par TOUTE l'équipe (contrairement à Notification ci-dessous, qui duplique
+// l'événement une fois par membre et est individuelle : lue/non-lue par
+// utilisateur). Alimenté depuis le même point d'entrée que les notifications
+// (voir NotificationsService.notifyProjectActivity), sert le panneau
+// "Aujourd'hui sur ce projet" scrollable côté frontend.
+// ============================================================================
+
+model ProjectActivity {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+
+  project_id  String   @db.ObjectId
+
+  // Même valeurs que NotificationType (project_activity | module_activity |
+  // requirement_activity | testcase_activity | generation_activity | export_activity)
+  type        String
+
+  message     String
+
+  actor_id    String?  @db.ObjectId
+  // Dénormalisé au moment de l'écriture (affichage immédiat sans jointure,
+  // et conservé même si l'utilisateur est supprimé par la suite).
+  actor_name  String?
+
+  entity_type String?
+  entity_id   String?
+
+  created_at  DateTime @default(now())
+
+  @@index([project_id, created_at])
+  @@map("project_activities")
+}
+
+// ============================================================================
+// NOTIFICATIONS — in-app (email en évolution future)
+// ============================================================================
+
+model Notification {
+  id           String    @id @default(auto()) @map("_id") @db.ObjectId
+
+  user_id      String    @db.ObjectId
+  user         User      @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  // "mention" | "comment_reply" | "comment_resolved" | "comment_reopened"
+  type         String
+
+  project_id   String?   @db.ObjectId
+  entity_type  String?
+  entity_id    String?
+  comment_id   String?   @db.ObjectId
+
+  // Auteur de l'événement à l'origine de la notification (affiché "X vous a mentionné")
+  actor_id     String?   @db.ObjectId
+
+  message      String
+  // Lien de navigation front (ex: /analyzer?project=..&req=..&comment=..)
+  link         String?
+
+  read         Boolean   @default(false)
+  read_at      DateTime?
+
+  created_at   DateTime  @default(now())
+
+  @@index([user_id, read])
+  @@index([user_id, created_at])
+  // Utilisé par CommentsService.getSeenBy pour retrouver, pour un commentaire
+  // donné, l'état de lecture (accusé "vu") de chaque destinataire mentionné.
+  @@index([comment_id])
+  @@map("notifications")
+}
+
+// ============================================================================
+// TEST WORKFLOWS — canvas de scénarios de test (étapes reliées + variables de
+// données corrélées entre elles), exécutables avec suivi de statut par étape.
+// Le graphe (nœuds/arêtes) est stocké en Json (structure libre façon
+// React Flow : {id, type, position, data}) plutôt qu'en collections
+// normalisées : il est toujours lu/écrit en bloc depuis le canvas, jamais
+// interrogé nœud par nœud côté serveur — même logique que Requirement.embedding
+// ou Requirement.pending_test_cases ci-dessus (Json pour une structure figée
+// côté frontend, propriétaire du format).
+// ============================================================================
+
+model TestWorkflow {
+  id              String    @id @default(auto()) @map("_id") @db.ObjectId
+  project_id      String    @db.ObjectId
+  project         Project   @relation(fields: [project_id], references: [id], onDelete: Cascade)
+
+  name            String
+  description     String?
+
+  // ── Graphe ──────────────────────────────────────────────────────────────
+  // nodes: WorkflowNode[]   { id, type: 'test_case'|'action'|'decision', position:{x,y}, data:{...} }
+  // edges: WorkflowEdge[]   { id, source, target, sourceHandle?, targetHandle?, data:{ variableName?, condition? } }
+  nodes           Json      @default("[]")
+  edges           Json      @default("[]")
+
+  // Variables de données de test corrélées à travers le workflow — déclaration
+  // globale réutilisée par les nœuds (producedByNodeId / consommée par d'autres
+  // nœuds) : WorkflowVariable[] { id, name, description?, exampleValue? }
+  variables       Json      @default("[]")
+
+  // ── Versioning / historique (voir EntityVersion + commentaire RequirementModule.version) ──
+  version         Int?      @default(1)
+
+  created_by_id   String?   @db.ObjectId
+  created_by      User?     @relation("WorkflowCreator", fields: [created_by_id], references: [id], onDelete: SetNull)
+
+  // ── Accès (avant validation) ────────────────────────────────────────────
+  // Liste des BA (autres que le créateur) autorisés à voir, modifier et
+  // (re)valider ce workflow tant qu'il est encore en brouillon. Choisie par
+  // le créateur (voir WorkflowService.setAssignedUsers) — un BA absent de
+  // cette liste ne voit même pas le brouillon (voir list()/getOne()). Une
+  // fois le workflow validé, il redevient visible en LECTURE par tout le
+  // projet (QA compris) ; cette liste continue cependant de déterminer qui
+  // peut le modifier/re-valider/supprimer.
+  assignedUserIds String[]  @db.ObjectId @default([])
+  assignedUsers   User[]    @relation("WorkflowAssignees", fields: [assignedUserIds], references: [id])
+
+  // Liste des QA autorisés à exécuter ce workflow une fois validé. Choisie
+  // par le créateur (voir WorkflowService.setAssignedQaUsers), séparément de
+  // la liste des BA ci-dessus. Fermé par défaut : liste vide = AUCUN QA ne
+  // peut l'exécuter tant que le créateur n'en a pas explicitement ajouté au
+  // moins un.
+  assignedQaIds   String[]  @db.ObjectId @default([])
+  assignedQas     User[]    @relation("WorkflowQaAssignees", fields: [assignedQaIds], references: [id])
+
+  // ── Validation (publication) ───────────────────────────────────────────
+  // Un workflow créé par un BA reste un brouillon (is_validated=false),
+  // visible uniquement par son créateur et les BA assignés ci-dessus, tant
+  // que celui-ci ne l'a pas explicitement validé. Une fois validé, il
+  // devient visible en lecture seule pour tout le projet (QA pour
+  // l'exécuter, ADMIN/BA pour le consulter).
+  is_validated    Boolean   @default(false)
+  validated_at    DateTime?
+  validated_by_id String?   @db.ObjectId
+  validated_by    User?     @relation("WorkflowValidator", fields: [validated_by_id], references: [id], onDelete: SetNull)
+
+  // ── Dernier run (dénormalisé pour affichage rapide en liste) ──────────────
+  last_run_status String?   // "running" | "passed" | "failed" | "partial" | "aborted"
+  last_run_at     DateTime?
+
+  created_at      DateTime  @default(now())
+  updated_at      DateTime  @updatedAt
+
+  runs            WorkflowRun[]
+
+  @@index([project_id])
+  @@map("test_workflows")
+}
+
+// ── Exécution d'un workflow — historique des runs ──────────────────────────
+model WorkflowRun {
+  id              String        @id @default(auto()) @map("_id") @db.ObjectId
+  workflow_id     String        @db.ObjectId
+  workflow        TestWorkflow  @relation(fields: [workflow_id], references: [id], onDelete: Cascade)
+  project_id      String        @db.ObjectId
+
+  status          String        @default("running") // running | passed | failed | partial | aborted
+
+  // Snapshot du graphe au lancement du run (le workflow peut continuer à être
+  // édité pendant qu'un run est en cours sans perturber son affichage).
+  nodes_snapshot  Json          @default("[]")
+  edges_snapshot  Json          @default("[]")
+
+  // WorkflowStepResult[] { nodeId, status: 'idle'|'passed'|'failed'|'skipped'|'blocked',
+  //   note?, variableValues?: Record<string,string>, startedAt?, finishedAt?, executedById? }
+  step_results    Json          @default("[]")
+
+  // Valeurs courantes des variables corrélées durant ce run — alimentées au
+  // fur et à mesure que les étapes productrices sont validées, consultées en
+  // lecture par les étapes consommatrices suivantes (Record<string,string>).
+  variable_values Json          @default("{}")
+
+  executed_by_id  String?       @db.ObjectId
+  executed_by     User?         @relation("WorkflowRunExecutor", fields: [executed_by_id], references: [id], onDelete: SetNull)
+
+  started_at      DateTime      @default(now())
+  finished_at     DateTime?
+
+  @@index([workflow_id, started_at])
+  @@index([project_id])
+  @@map("workflow_runs")
+}
+
+// ============================================================================
+// VERSIONING / HISTORIQUE — un seul modèle générique pour toutes les entités
+// versionnées (Requirement, RequirementModule, TestCase, TestWorkflow), plutôt
+// qu'une table dédiée par entité. Voir VersionsService (src/versions/).
+// ============================================================================
+
+// Un instantané (snapshot) des champs "de contenu" d'une entité, capturé
+// juste AVANT chaque modification (create/update/restore) — permet de :
+//  1) lister l'historique des versions d'une entité (BA/QA "Historique")
+//  2) restaurer (rollback) une version antérieure en un clic
+// `snapshot` ne contient QUE les champs éditables/métier (pas les timestamps,
+// pas les relations, pas les champs calculés type embedding/needs_review) —
+// voir les listes de champs versionnés dans ProjectService/WorkflowService.
+model EntityVersion {
+  id              String   @id @default(auto()) @map("_id") @db.ObjectId
+  project_id      String   @db.ObjectId
+
+  // "requirement_module" | "requirement" | "test_case" | "test_workflow"
+  // (voir src/shared/version-types.ts pour les constantes)
+  entity_type     String
+  entity_id       String   @db.ObjectId
+
+  // Numéro de la version archivée dans CE snapshot (1 = état à la création).
+  // L'entité elle-même porte son numéro de version COURANT dans son propre
+  // champ `version` — cette colonne ici correspond à l'état "d'avant" au
+  // moment où la version suivante a été créée.
+  version_number  Int
+
+  // État complet des champs versionnés au moment de cette version.
+  snapshot        Json
+
+  // "create" | "update" | "delete" | "restore"
+  change_type     String   @default("update")
+  // Résumé lisible ("description, priorité modifiées") — affiché dans la
+  // timeline d'historique sans avoir à diffier le JSON côté client.
+  change_summary  String?
+
+  changed_by_id   String?  @db.ObjectId
+  changed_by_name String?
+
+  created_at      DateTime @default(now())
+
+  @@index([project_id])
+  @@index([entity_type, entity_id, version_number])
+  @@map("entity_versions")
+}

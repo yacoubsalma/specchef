@@ -1,0 +1,10 @@
+# Extraction de texte (analyzer/analyze.py)
+docling
+pdfplumber
+pypdf
+openpyxl
+
+# Micro-service de comptage de tokens (tokenizer-server.py)
+transformers
+langfuse
+python-dotenv
